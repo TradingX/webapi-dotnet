@@ -1,0 +1,123 @@
+name: Security Updates Check
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  # Allow manual trigger
+  workflow_dispatch:
+
+env:
+  PROJECT_PATH: './services/webapi/src/webapi.csproj'
+  TEST_PATH: './services/webapi/tests/'
+
+jobs:
+  security-check:
+    name: "Check for Security Vulnerabilities"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET Core
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore packages
+        run: dotnet restore
+
+      - name: Check for security vulnerabilities
+        id: security-check
+        run: |
+          echo "Checking for security vulnerabilities..."
+          VULN_OUTPUT=$(dotnet list package --vulnerable --source https://api.nuget.org/v3/index.json)
+          echo "$VULN_OUTPUT"
+          
+          if echo "$VULN_OUTPUT" | grep -q "has no vulnerable packages"; then
+            echo "vulnerabilities_found=false" >> $GITHUB_OUTPUT
+            echo "✅ No security vulnerabilities found!"
+          else
+            echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Security vulnerabilities detected!"
+            echo "vuln_details<<EOF" >> $GITHUB_OUTPUT
+            echo "$VULN_OUTPUT" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for outdated packages
+        if: steps.security-check.outputs.vulnerabilities_found == 'false'
+        run: |
+          echo "Checking for outdated packages..."
+          dotnet list package --outdated --source https://api.nuget.org/v3/index.json
+
+      - name: Create Issue for Security Vulnerabilities
+        if: steps.security-check.outputs.vulnerabilities_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '🚨 Security Vulnerabilities Detected in NuGet Packages';
+            const body = `
+            ## Security Alert
+
+            Automated security scan has detected vulnerabilities in the following packages:
+
+            \`\`\`
+            ${{ steps.security-check.outputs.vuln_details }}
+            \`\`\`
+
+            ## Action Required
+
+            Please review and update the vulnerable packages immediately by:
+
+            1. Running the upgrade script: \`./scripts/upgrade-packages.sh --security-only\`
+            2. Or manually updating the affected packages in the .csproj files
+            3. Testing the application after updates
+            4. Creating a PR with the security fixes
+
+            ## Automated Detection
+
+            This issue was automatically created by the Security Updates Check workflow.
+            Scan performed on: ${new Date().toISOString()}
+
+            **Priority:** HIGH - Security vulnerabilities should be addressed immediately.
+            `;
+
+            // Check if issue already exists
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['security', 'automated'],
+              state: 'open'
+            });
+
+            const existingIssue = existingIssues.data.find(issue => 
+              issue.title.includes('Security Vulnerabilities Detected')
+            );
+
+            if (existingIssue) {
+              // Update existing issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: `## Updated Security Scan Results\n\n${body}`
+              });
+              console.log('Updated existing security issue:', existingIssue.number);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['security', 'automated', 'high-priority']
+              });
+              console.log('Created new security issue:', issue.data.number);
+            }
+
+      - name: Build and test to ensure current state is working
+        run: |
+          dotnet build ${{ env.PROJECT_PATH }}
+          dotnet test ${{ env.TEST_PATH }}
